@@ -40,11 +40,40 @@ from .utils import (array_repr_oneline, check_broadcast, combine_labels,
                     IncompatibleShapeError, AliasDict)
 
 from .parameters import Parameter, InputParameterError
+from .altcompound import _AltCompoundModel
+
 
 
 __all__ = ['Model', 'FittableModel', 'Fittable1DModel', 'Fittable2DModel',
-           'ModelDefinitionError']
+           'custom_model', 'ModelDefinitionError', 'set_compound_model']
 
+# global variable for which Compound Model class to use
+COMPOUND = "regular" # alternative is "lite"
+
+# xxx todo: need to make this thread safe
+def set_compound_model(ctype="regular"):
+    '''
+    Allow setting of the global state of which compound model class 
+    to use in constructing expressions of models. 
+
+    The two permitted values are "regular" and "lite", the 
+    latter being less filling (of memory).
+
+    It returns the previous state as a convenience for restoring in
+    a subsequent call
+    '''
+    global COMPOUND
+    if ctype not in  ['regular', 'lite']:
+        raise ValueError("argument value must be 'regular' or 'lite'")
+    previous = COMPOUND
+    COMPOUND = ctype
+    return previous
+
+def _compound_operator(oper, left, right, **kwargs):
+    if COMPOUND == 'regular':
+        return _CompoundModelMeta._from_operator(oper, left, right, **kwargs)
+    else:
+        return _AltCompoundModel(oper, left, right, **kwargs)
 
 class ModelDefinitionError(TypeError):
     """Used for incorrect models definitions"""
@@ -65,9 +94,9 @@ def _model_oper(oper, **kwargs):
     # _CompoundModelMeta has not been defined yet.
 
     # Perform an arithmetic operation on two models.
-    return lambda left, right: CompoundModel(oper,
+    return lambda left, right: _compound_operator(oper,
             left, right, **kwargs)
-
+    
 
 class _ModelMeta(InheritDocstrings, abc.ABCMeta):
     """
@@ -1339,52 +1368,602 @@ class Fittable2DModel(FittableModel):
     outputs = ('z',)
 
 
-class CompoundModel:
+def _make_arithmetic_operator(oper):
+    # We don't bother with tuple unpacking here for efficiency's sake, but for
+    # documentation purposes:
+    #
+    #     f_eval, f_n_inputs, f_n_outputs = f
+    #
+    # and similarly for g
+    def op(f, g):
+        return (make_binary_operator_eval(oper, f[0], g[0]), f[1], f[2])
 
-    def __init__(self, op, left, right, name=None):
-        self.op = op
-        self.left = left
-        self.right = right
-        self.name = name
+    return op
 
-    def __call__(self, *args, **kw):
-        op = self.op
-        if op != '&':
-            leftval = self.left(*args, **kw)
-            if op != '|':
-                rightval = self.right(*args, **kw)
-        if op == '+':
-            return sum(leftval , rightval)
-        elif op == '-':
-            return leftval - rightval
-        elif op == '*':
-            return leftval * rightval
-        elif op == '/':
-            return leftval / rightval
-        elif op == '**':
-            return leftval ** rightval
-        elif op == '&':
-            return 
-        elif op == '|':
-            return self.right(leftval, **kw)
+
+def _composition_operator(f, g):
+    # We don't bother with tuple unpacking here for efficiency's sake, but for
+    # documentation purposes:
+    #
+    #     f_eval, f_n_inputs, f_n_outputs = f
+    #
+    # and similarly for g
+    return (lambda inputs, params: g[0](f[0](inputs, params), params),
+            f[1], g[2])
+
+
+def _join_operator(f, g):
+    # We don't bother with tuple unpacking here for efficiency's sake, but for
+    # documentation purposes:
+    #
+    #     f_eval, f_n_inputs, f_n_outputs = f
+    #
+    # and similarly for g
+    return (lambda inputs, params: (f[0](inputs[:f[1]], params) +
+                                    g[0](inputs[f[1]:], params)),
+            f[1] + g[1], f[2] + g[2])
+
+
+# TODO: Support a couple unary operators--at least negation?
+BINARY_OPERATORS = {
+    '+': _make_arithmetic_operator(operator.add),
+    '-': _make_arithmetic_operator(operator.sub),
+    '*': _make_arithmetic_operator(operator.mul),
+    '/': _make_arithmetic_operator(operator.truediv),
+    '**': _make_arithmetic_operator(operator.pow),
+    '|': _composition_operator,
+    '&': _join_operator
+}
+
+
+_ORDER_OF_OPERATORS = [('|',), ('&',), ('+', '-'), ('*', '/'), ('**',)]
+OPERATOR_PRECEDENCE = {}
+for idx, ops in enumerate(_ORDER_OF_OPERATORS):
+    for op in ops:
+        OPERATOR_PRECEDENCE[op] = idx
+del idx, op, ops
+
+
+class _CompoundModelMeta(_ModelMeta):
+    _tree = None
+    _submodels = None
+    _submodel_names = None
+    _nextid = 0
+
+    _param_names = None
+    # _param_map is a mapping of the compound model's generated param names to
+    # the parameters of submodels they are associated with.  The values in this
+    # mapping are (idx, name) tuples were idx is the index of the submodel this
+    # parameter is associated with, and name is the same parameter's name on
+    # the submodel
+    # In principle this will allow compound models to give entirely new names
+    # to parameters that don't have to be the same as their original names on
+    # the submodels, but right now that isn't taken advantage of
+    _param_map = None
+
+    _slice_offset = 0
+    # When taking slices of a compound model, this keeps track of how offset
+    # the first model in the slice is from the first model in the original
+    # compound model it was taken from
+
+    # This just inverts _param_map, swapping keys with values.  This is also
+    # useful to have.
+    _param_map_inverse = None
+    _fittable = None
+
+    _evaluate = None
+
+    def __getitem__(cls, index):
+        index = cls._normalize_index(index)
+
+        if isinstance(index, int):
+            return cls._get_submodels()[index]
         else:
-            raise ValueError('unrecognized operator')
+            return cls._get_slice(index.start, index.stop)
 
-def sum(left, right, **kw):
-    '''
-    Sum over all inputs in tuple, if present
-    '''
-    if isinstance(left, tuple) and isinstance(right, tuple):
-        if len(left) == len(right):
-            return tuple([item[0] + item[1] for item in zip(left, right)])
+    def __getattr__(cls, attr):
+        # Make sure the _tree attribute is set; otherwise we are not looking up
+        # an attribute on a concrete compound model class and should just raise
+        # the AttributeError
+        if cls._tree is not None and attr in cls.param_names:
+            cls._init_param_descriptors()
+            return getattr(cls, attr)
+
+        raise AttributeError(attr)
+
+    def __repr__(cls):
+        if cls._tree is None:
+            # This case is mostly for debugging purposes
+            return cls._format_cls_repr()
+
+        expression = cls._format_expression()
+        components = '\n\n'.join('[{0}]: {1!r}'.format(idx, m)
+                                 for idx, m in enumerate(cls._get_submodels()))
+        keywords = [
+            ('Expression', expression),
+            ('Components', '\n' + indent(components))
+        ]
+
+        return cls._format_cls_repr(keywords=keywords)
+
+    def __dir__(cls, *args):
+        """
+        Returns a list of attributes defined on a compound model, including
+        all of its parameters.
+        """
+
+        # The *args is to address a bug (?) on Python 2.6 where the dir()
+        # builtin calls __dir__ with an additional (unused) argument
+
+        try:
+            # Annoyingly, this will only work for Python 3.3+
+            basedir = super(_CompoundModelMeta, cls).__dir__()
+        except AttributeError:
+            basedir = list(set((dir(type(cls)) + list(cls.__dict__))))
+
+        if cls._tree is not None:
+            for name in cls.param_names:
+                basedir.append(name)
+
+            basedir.sort()
+
+        return basedir
+
+    @property
+    def submodel_names(cls):
+        if cls._submodel_names is not None:
+            return cls._submodel_names
+
+        by_name = defaultdict(list)
+
+        for idx, submodel in enumerate(cls._get_submodels()):
+            # Keep track of the original sort order of the submodels
+            by_name[submodel.name].append(idx)
+
+        names = []
+        for basename, indices in six.iteritems(by_name):
+            if len(indices) == 1:
+                # There is only one model with this name, so it doesn't need an
+                # index appended to its name
+                names.append((basename, indices[0]))
+            else:
+                for idx in indices:
+                    names.append(('{0}_{1}'.format(basename, idx), idx))
+
+        # Sort according to the models' original sort orders
+        names.sort(key=lambda k: k[1])
+
+        names = tuple(k[0] for k in names)
+
+        cls._submodels_names = names
+        return names
+
+    @property
+    def param_names(cls):
+        if cls._param_names is None:
+            cls._init_param_names()
+
+        return cls._param_names
+
+    @property
+    def fittable(cls):
+        if cls._fittable is None:
+            cls._fittable = all(m.fittable for m in cls._get_submodels())
+
+        return cls._fittable
+
+    # TODO: Maybe we could use make_function_with_signature for evaluate, but
+    # it's probably not worth it (and I'm not sure what the limit is on number
+    # of function arguments/local variables but we could break that limit for
+    # complicated compound models...
+    def evaluate(cls, *args):
+        if cls._evaluate is None:
+            func = cls._tree.evaluate(BINARY_OPERATORS,
+                                      getter=cls._model_evaluate_getter)[0]
+            # Making this a staticmethod isn't strictly necessary for Python 3,
+            # but it is necessary on Python 2 since looking up cls._evaluate
+            # will return an unbound method otherwise
+            cls._evaluate = staticmethod(func)
+
+        inputs = args[:cls.n_inputs]
+        params = iter(args[cls.n_inputs:])
+        result = cls._evaluate(inputs, params)
+
+        if cls.n_outputs == 1:
+            return result[0]
         else:
-            raise ValueError("number of inputs for arithmetic operator must match") 
-    elif type(left) == type(np.array([0])) and type(right) == type(np.array([0])):
-        return left + right
-    else:
-        raise ValueError("mismatched types of inputs for arithmetic operator")    
+            return result
 
+    # TODO: This supports creating a new compound model from two existing
+    # compound models (or normal models) and a single operator.  However, it
+    # ought also to be possible to create a new model from an *entire*
+    # expression, represented as a sequence of operators and their operands (or
+    # an exiting ExpressionTree) and build that into a compound model without
+    # creating an intermediate _CompoundModel class for every single operator
+    # in the expression.  This will prove to be a useful optimization in many
+    # cases
+    @classmethod
+    def _from_operator(mcls, operator, left, right, additional_members={}):
+        """
+        Given a Python operator (represented by a string, such as ``'+'``
+        or ``'*'``, and two model classes or instances, return a new compound
+        model that evaluates the given operator on the outputs of the left and
+        right input models.
+
+        If either of the input models are a model *class* (i.e. a subclass of
+        `~astropy.modeling.Model`) then the returned model is a new subclass of
+        `~astropy.modeling.Model` that may be instantiated with any parameter
+        values.  If both input models are *instances* of a model, a new class
+        is still created, but this method returns an *instance* of that class,
+        taking the parameter values from the parameters of the input model
+        instances.
+
+        If given, the ``additional_members`` `dict` may provide additional
+        class members that should be added to the generated
+        `~astropy.modeling.Model` subclass.  Some members that are generated by
+        this method should not be provided by ``additional_members``.  These
+        include ``_tree``, ``inputs``, ``outputs``, ``linear``,
+        ``standard_broadcasting``, and ``__module__`.  This is currently for
+        internal use only.
+        """
+
+        # Note, currently this only supports binary operators, but could be
+        # easily extended to support unary operators (namely '-') if/when
+        # needed
+        children = []
+        for child in (left, right):
+            if isinstance(child, (_CompoundModelMeta, _CompoundModel)):
+                children.append(child._tree)
+            else:
+                children.append(ExpressionTree(child))
+
+        tree = ExpressionTree(operator, left=children[0], right=children[1])
+
+        name = str('CompoundModel{0}'.format(_CompoundModelMeta._nextid))
+        _CompoundModelMeta._nextid += 1
+
+        mod = find_current_module(3)
+        if mod:
+            modname = mod.__name__
+        else:
+            modname = '__main__'
+
+        # TODO: These aren't the full rules for handling inputs and outputs, but
+        # this will handle most basic cases correctly
+        if operator == '|':
+            inputs = left.inputs
+            outputs = right.outputs
+
+            if left.n_outputs != right.n_inputs:
+                raise ModelDefinitionError(
+                    "Unsupported operands for |: {0} (n_inputs={1}, "
+                    "n_outputs={2}) and {3} (n_inputs={4}, n_outputs={5}); "
+                    "n_outputs for the left-hand model must match n_inputs "
+                    "for the right-hand model.".format(
+                        left.name, left.n_inputs, left.n_outputs, right.name,
+                        right.n_inputs, right.n_outputs))
+        elif operator == '&':
+            inputs = combine_labels(left.inputs, right.inputs)
+            outputs = combine_labels(left.outputs, right.outputs)
+        else:
+            # Without loss of generality
+            inputs = left.inputs
+            outputs = left.outputs
+
+            if (left.n_inputs != right.n_inputs or
+                    left.n_outputs != right.n_outputs):
+                raise ModelDefinitionError(
+                    "Unsupported operands for {0}: {1} (n_inputs={2}, "
+                    "n_outputs={3}) and {4} (n_inputs={5}, n_outputs={6}); "
+                    "models must have the same n_inputs and the same "
+                    "n_outputs for this operator".format(
+                        operator, left.name, left.n_inputs, left.n_outputs,
+                        right.name, right.n_inputs, right.n_outputs))
+
+        if operator in ('|', '+', '-'):
+            linear = left.linear and right.linear
+        else:
+            # Which is not to say it is *definitely* not linear but it would be
+            # trickier to determine
+            linear = False
+
+        standard_broadcasting = \
+                left.standard_broadcasting and right.standard_broadcasting
+
+        # Note: If any other members are added here, make sure to mention them
+        # in the docstring of this method.
+        members = additional_members
+        members.update({
+            '_tree': tree,
+            # TODO: These are temporary until we implement the full rules
+            # for handling inputs/outputs
+            'inputs': inputs,
+            'outputs': outputs,
+            'linear': linear,
+            'standard_broadcasting': standard_broadcasting,
+            '__module__': str(modname)})
+
+        new_cls = mcls(name, (_CompoundModel,), members)
+
+        if isinstance(left, Model) and isinstance(right, Model):
+            # Both models used in the operator were already instantiated models,
+            # not model *classes*.  As such it's not particularly useful to return
+            # the class itself, but to instead produce a new instance:
+            return new_cls()
+
+        # Otherwise return the new uninstantiated class itself
+        return new_cls
+
+    @classmethod
+    def _handle_backwards_compat(mcls, name, members):
+        # Override _handle_backwards_compat from _ModelMeta to be a no-op; it
+        # is not needed since compound models did not exist before version 1.0
+        # anyways.
+
+        # TODO: Remove this at the same time as removing
+        # _ModelMeta._handle_backwards_compat
+        return
+
+    # TODO: Perhaps, just perhaps, the post-order (or ???-order) ordering of
+    # leaf nodes is something the ExpressionTree class itself could just know
+    def _get_submodels(cls):
+        # Would make this a lazyproperty but those don't currently work with
+        # type objects
+        if cls._submodels is not None:
+            return cls._submodels
+
+        submodels = [c.value for c in cls._tree.traverse_postorder()
+                     if c.isleaf]
+        cls._submodels = submodels
+        return submodels
+
+    def _init_param_descriptors(cls):
+        """
+        This routine sets up the names for all the parameters on a compound
+        model, including figuring out unique names for those parameters and
+        also mapping them back to their associated parameters of the underlying
+        submodels.
+
+        Setting this all up is costly, and only necessary for compound models
+        that a user will directly interact with.  For example when building an
+        expression like::
+
+            >>> M = (Model1 + Model2) * Model3  # doctest: +SKIP
+
+        the user will generally never interact directly with the temporary
+        result of the subexpression ``(Model1 + Model2)``.  So there's no need
+        to setup all the parameters for that temporary throwaway.  Only once
+        the full expression is built and the user initializes or introspects
+        ``M`` is it necessary to determine its full parameterization.
+        """
+
+        # Accessing cls.param_names will implicitly call _init_param_names if
+        # needed and thus also set up the _param_map; I'm not crazy about that
+        # design but it stands for now
+        for param_name in cls.param_names:
+            submodel_idx, submodel_param = cls._param_map[param_name]
+            submodel = cls[submodel_idx]
+
+            orig_param = getattr(submodel, submodel_param, None)
+            if not isinstance(orig_param, Parameter):
+                # This is just a pathological case that is only really needed
+                # to support the deprecated _CompositeModel--composite models
+                # claim to have some parameters, but don't actually implement
+                # the parameter descriptors, so we just make one up basically,
+                # with a default value of zero.  This value will just be thrown
+                # away, basically.
+                # TODO: Remove this special case once the legacy interfaces
+                # have been removed (basically this entire if statement--keep
+                # only the parts in the else: clause.
+                new_param = Parameter(name=param_name, default=0)
+            else:
+                if isinstance(submodel, Model):
+                    # Take the parameter's default from the model's value for that
+                    # parameter
+                    default = orig_param.value
+                else:
+                    default = orig_param.default
+
+                # Copy constraints
+                constraints = dict((key, getattr(orig_param, key))
+                                   for key in Model.parameter_constraints)
+
+                # Note: Parameter.copy() returns a new unbound Parameter, never
+                # a bound Parameter even if submodel is a Model instance (as
+                # opposed to a Model subclass)
+                new_param = orig_param.copy(name=param_name, default=default,
+                                            **constraints)
+
+            setattr(cls, param_name, new_param)
+
+    def _init_param_names(cls):
+        """
+        This subroutine is solely for setting up the ``param_names`` attribute
+        itself.
+
+        See ``_init_param_descriptors`` for the full parameter setup.
+        """
+
+        # Currently this skips over Model *instances* in the expression tree;
+        # basically these are treated as constants and do not add
+        # fittable/tunable parameters to the compound model.
+        # TODO: I'm not 100% happy with this design, and maybe we need some
+        # interface for distinguishing fittable/settable parameters with
+        # *constant* parameters (which would be distinct from parameters with
+        # fixed constraints since they're permanently locked in place). But I'm
+        # not sure if this is really the best way to treat the issue.
+
+        names = []
+        param_map = {}
+
+        # Start counting the suffix indices to put on parameter names from the
+        # slice_offset.  Usually this will just be zero, but for compound
+        # models that were sliced from another compound model this may be > 0
+        param_suffix = cls._slice_offset
+
+        for idx, model in enumerate(cls._get_submodels()):
+            if not model.param_names:
+                # Skip models that don't have parameters in the numbering
+                # TODO: Reevaluate this if it turns out to be confusing, though
+                # parameter-less models are not very common in practice (there
+                # are a few projections that don't take parameters)
+                continue
+
+            for param_name in model.param_names:
+                # This is sort of heuristic, but we want to check that
+                # model.param_name *actually* returns a Parameter descriptor,
+                # and that the model isn't some inconsistent type that happens
+                # to have a param_names attribute but does not actually
+                # implement settable parameters.
+                # In the future we can probably remove this check, but this is
+                # here specifically to support the legacy compat
+                # _CompositeModel which can be considered a pathological case
+                # in the context of the new framework
+                #if not isinstance(getattr(model, param_name, None),
+                #                  Parameter):
+                #    break
+                name = '{0}_{1}'.format(param_name, param_suffix + idx)
+                names.append(name)
+                param_map[name] = (idx, param_name)
+
+        cls._param_names = tuple(names)
+        cls._param_map = param_map
+        cls._param_map_inverse = dict((v, k) for k, v in param_map.items())
+
+    def _format_expression(cls):
+        # TODO: At some point might be useful to make a public version of this,
+        # albeit with more formatting options
+        return cls._tree.format_expression(OPERATOR_PRECEDENCE)
+
+    def _normalize_index(cls, index):
+        """
+        Converts an index given to __getitem__ to either an integer, or
+        a slice with integer start and stop values.
+
+        If the length of the slice is exactly 1 this converts the index to a
+        simple integer lookup.
+
+        Negative integers are converted to positive integers.
+        """
+
+        def get_index_from_name(name):
+            try:
+                return cls.submodel_names.index(name)
+            except ValueError:
+                raise IndexError(
+                    'Compound model {0} does not have a component named '
+                    '{1}'.format(cls.name, name))
+
+        def check_for_negative_index(index):
+            if index < 0:
+                new_index = len(cls.submodel_names) + index
+                if new_index < 0:
+                    # If still < 0 then this is an invalid index
+                    raise IndexError(
+                            "Model index {0} out of range.".format(index))
+                else:
+                    index = new_index
+
+            return index
+
+        if isinstance(index, six.string_types):
+            return get_index_from_name(index)
+        elif isinstance(index, slice):
+            if index.step not in (1, None):
+                # In principle it could be but I can scarcely imagine a case
+                # where it would be useful.  If someone can think of one then
+                # we can enable it.
+                raise ValueError(
+                    "Step not supported for compound model slicing.")
+            start = index.start if index.start is not None else 0
+            stop = (index.stop
+                    if index.stop is not None else len(cls.submodel_names))
+            if isinstance(start, int):
+                start = check_for_negative_index(start)
+            if isinstance(stop, int):
+                stop = check_for_negative_index(stop)
+            if isinstance(start, six.string_types):
+                start = get_index_from_name(start)
+            if isinstance(stop, six.string_types):
+                stop = get_index_from_name(stop) + 1
+            length = stop - start
+
+            if length == 1:
+                return start
+            elif length <= 0:
+                raise ValueError("Empty slice of a compound model.")
+
+            return slice(start, stop)
+        elif isinstance(index, int):
+            if index >= len(cls.submodel_names):
+                raise IndexError(
+                        "Model index {0} out of range.".format(index))
+
+            return check_for_negative_index(index)
+
+        raise TypeError(
+            'Submodels can be indexed either by their integer order or '
+            'their name (got {0!r}).'.format(index))
+
+    def _get_slice(cls, start, stop):
+        """
+        Return a new model build from a sub-expression of the expression
+        represented by this model.
+
+        Right now this is highly inefficient, as it creates a new temporary
+        model for each operator that appears in the sub-expression.  It would
+        be better if this just built a new expression tree, and the new model
+        instantiated directly from that tree.
+
+        Once tree -> model instantiation is possible this should be fixed to
+        use that instead.
+        """
+
+        members = {'_slice_offset': cls._slice_offset + start}
+        operators = dict((oper, _model_oper(oper, additional_members=members))
+                         for oper in BINARY_OPERATORS)
+
+        return cls._tree.evaluate(operators, start=start, stop=stop)
+
+    @staticmethod
+    def _model_evaluate_getter(idx, model):
+        n_params = len(model.param_names)
+        n_inputs = model.n_inputs
+        n_outputs = model.n_outputs
+
+        # There is currently an unfortunate inconsistency in some models, which
+        # requires them to be instantiated for their evaluate to work.  I think
+        # that needs to be reconsidered and fixed somehow, but in the meantime
+        # we need to check for that case
+        if (not isinstance(model, Model) and
+                isinstancemethod(model, model.evaluate)):
+            if n_outputs == 1:
+                # Where previously model was a class, now make an instance
+                def f(inputs, params):
+                    param_values = tuple(islice(params, n_params))
+                    return (model(*param_values).evaluate(
+                        *chain(inputs, param_values)),)
+            else:
+                def f(inputs, params):
+                    param_values = tuple(islice(params, n_params))
+                    return model(*param_values).evaluate(
+                        *chain(inputs, param_values))
+        else:
+            evaluate = model.evaluate
+            if n_outputs == 1:
+                f = lambda inputs, params: \
+                    (evaluate(*chain(inputs, islice(params, n_params))),)
+            else:
+                f = lambda inputs, params: \
+                    evaluate(*chain(inputs, islice(params, n_params)))
+
+        return (f, n_inputs, n_outputs)
+
+
+@six.add_metaclass(_CompoundModelMeta)
 class _CompoundModel(Model):
+    fit_deriv = None
+    col_fit_deriv = False
 
     _submodels = None
 
@@ -1412,6 +1991,14 @@ class _CompoundModel(Model):
     @property
     def submodel_names(self):
         return self.__class__.submodel_names
+
+    @property
+    def param_names(self):
+        return self.__class__.param_names
+
+    @property
+    def fittable(self):
+        return self.__class__.fittable
 
     @sharedmethod
     def evaluate(self, *args):
@@ -1458,6 +2045,157 @@ class _CompoundModel(Model):
     def _get_submodels(self):
         return self.__class__._get_submodels()
 
+
+def custom_model(*args, **kwargs):
+    """
+    Create a model from a user defined function. The inputs and parameters of
+    the model will be inferred from the arguments of the function.
+
+    This can be used either as a function or as a decorator.  See below for
+    examples of both usages.
+
+    .. note::
+
+        All model parameters have to be defined as keyword arguments with
+        default values in the model function.  Use `None` as a default argument
+        value if you do not want to have a default value for that parameter.
+
+    Parameters
+    ----------
+    func : function
+        Function which defines the model.  It should take N positional
+        arguments where ``N`` is dimensions of the model (the number of
+        independent variable in the model), and any number of keyword arguments
+        (the parameters).  It must return the value of the model (typically as
+        an array, but can also be a scalar for scalar inputs).  This
+        corresponds to the `~astropy.modeling.Model.evaluate` method.
+    fit_deriv : function, optional
+        Function which defines the Jacobian derivative of the model. I.e., the
+        derivative with respect to the *parameters* of the model.  It should
+        have the same argument signature as ``func``, but should return a
+        sequence where each element of the sequence is the derivative
+        with respect to the corresponding argument. This corresponds to the
+        :meth:`~astropy.modeling.FittableModel.fit_deriv` method.
+
+    Examples
+    --------
+    Define a sinusoidal model function as a custom 1D model::
+
+        >>> from astropy.modeling.models import custom_model
+        >>> import numpy as np
+        >>> def sine_model(x, amplitude=1., frequency=1.):
+        ...     return amplitude * np.sin(2 * np.pi * frequency * x)
+        >>> def sine_deriv(x, amplitude=1., frequency=1.):
+        ...     return 2 * np.pi * amplitude * np.cos(2 * np.pi * frequency * x)
+        >>> SineModel = custom_model(sine_model, fit_deriv=sine_deriv)
+
+    Create an instance of the custom model and evaluate it::
+
+        >>> model = SineModel()
+        >>> model(0.25)
+        1.0
+
+    This model instance can now be used like a usual astropy model.
+
+    The next example demonstrates a 2D Moffat function model, and also
+    demonstrates the support for docstrings (this example could also include
+    a derivative, but it has been omitted for simplicity)::
+
+        >>> @custom_model
+        ... def Moffat2D(x, y, amplitude=1.0, x_0=0.0, y_0=0.0, gamma=1.0,
+        ...            alpha=1.0):
+        ...     \"\"\"Two dimensional Moffat function.\"\"\"
+        ...     rr_gg = ((x - x_0) ** 2 + (y - y_0) ** 2) / gamma ** 2
+        ...     return amplitude * (1 + rr_gg) ** (-alpha)
+        ...
+        >>> print(Moffat2D.__doc__)
+        Two dimensional Moffat function.
+        >>> model = Moffat2D()
+        >>> model(1, 1)  # doctest: +FLOAT_CMP
+        0.3333333333333333
+    """
+
+    fit_deriv = kwargs.get('fit_deriv', None)
+
+    if len(args) == 1 and six.callable(args[0]):
+        return _custom_model_wrapper(args[0], fit_deriv=fit_deriv)
+    elif not args:
+        return functools.partial(_custom_model_wrapper, fit_deriv=fit_deriv)
+    else:
+        raise TypeError(
+            "{0} takes at most one positional argument (the callable/"
+            "function to be turned into a model.  When used as a decorator "
+            "it should be passed keyword arguments only (if "
+            "any).".format(__name__))
+
+
+def _custom_model_wrapper(func, fit_deriv=None):
+    """
+    Internal implementation `custom_model`.
+
+    When `custom_model` is called as a function its arguments are passed to
+    this function, and the result of this function is returned.
+
+    When `custom_model` is used as a decorator a partial evaluation of this
+    function is returned by `custom_model`.
+    """
+
+    if not six.callable(func):
+        raise ModelDefinitionError(
+            "func is not callable; it must be a function or other callable "
+            "object")
+
+    if fit_deriv is not None and not six.callable(fit_deriv):
+        raise ModelDefinitionError(
+            "fit_deriv not callable; it must be a function or other "
+            "callable object")
+
+    model_name = func.__name__
+    argspec = inspect.getargspec(func)
+    param_values = argspec.defaults or ()
+
+    nparams = len(param_values)
+    param_names = argspec.args[-nparams:]
+
+    if (fit_deriv is not None and
+            len(six.get_function_defaults(fit_deriv)) != nparams):
+        raise ModelDefinitionError("derivative function should accept "
+                                   "same number of parameters as func.")
+
+    if nparams:
+        input_names = argspec.args[:-nparams]
+    else:
+        input_names = argspec.args
+
+    # TODO: Maybe have a clever scheme for default output name?
+    if input_names:
+        output_names = (input_names[0],)
+    else:
+        output_names = ('x',)
+
+    params = dict((name, Parameter(name, default=default))
+                  for name, default in zip(param_names, param_values))
+
+    mod = find_current_module(2)
+    if mod:
+        modname = mod.__name__
+    else:
+        modname = '__main__'
+
+    members = {
+        '__module__': str(modname),
+        '__doc__': func.__doc__,
+        'inputs': tuple(input_names),
+        'outputs': output_names,
+        'evaluate': staticmethod(func),
+    }
+
+    if fit_deriv is not None:
+        members['fit_deriv'] = staticmethod(fit_deriv)
+
+    members.update(params)
+
+    return type(model_name, (FittableModel,), members)
 
 
 def _prepare_inputs_single_model(model, params, inputs, **kwargs):
